@@ -59,6 +59,17 @@ struct ModelGeometry {
     ModelFamily family = ModelFamily::Qwen4Exp;
     int64_t n_mtp_layers = 0;       ///< MTP blocks inside the model file, after the trunk (qwen35moe: blk.40)
 
+    // MemT-1.0 native memory (a MemT qwen35moe file only; every stock file has has_memt == false).
+    // The six blk.<i>.memt.* tensors sit on the full-attention layers and are runtime-sized.
+    bool has_memt = false;
+    int64_t memt_heads = 0;         ///< memt.head_count (16 in the release; must equal n_head)
+    int64_t memt_head_dim = 0;      ///< memt.head_dim (256; must equal head_dim)
+    int64_t memt_gate_rank = 0;     ///< memt.gate_rank (256; must equal head_dim in the release)
+    int64_t memt_chunk_tokens = 0;  ///< memt.chunk_tokens (2048): one memory write event
+    double memt_softcap = 0.0;      ///< memt.output_gate_softcap_limit (2.0): the output gate's tanh limit
+    double memt_eps = 0.0;          ///< memt.rms_norm_epsilon (1e-6): the memory read's gated RMSNorm
+    char memt_identity[65] = {};    ///< memt.identity: the checkpoint's 64-hex memt-memory-v1 identity (empty: none)
+
     constexpr bool has_indexer() const { return idx_q_heads > 0; }              ///< false: dense attention only
     constexpr bool has_hyper_connections() const { return hc > 0; }             ///< false: plain pre-norm residual
     constexpr int64_t hc_dim() const { return hc * n_embd; }

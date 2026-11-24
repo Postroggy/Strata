@@ -9,6 +9,7 @@
 // (checked on an RX 6700 XT with ROCm 10.1's librocm_kpack, rocblas_sscal from copied libraries).  A value the caller set wins.
 // Header only: tools/vision includes it too.
 #include <algorithm>
+#include <cstdint>
 #include <cstdlib>
 #include <string>
 #include <vector>
@@ -16,6 +17,10 @@
 #include <dirent.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#if defined(__APPLE__)
+#include <climits>
+#include <mach-o/dyld.h>
+#endif
 #endif
 
 namespace strata::core::kpack_path {
@@ -52,9 +57,19 @@ inline std::string exe_dir() {
     return "";
 #else
     char buf[4096];
+#if defined(__APPLE__)
+    // macOS has no /proc/self/exe
+    uint32_t size = sizeof(buf);
+    if (_NSGetExecutablePath(buf, &size) != 0) return "";
+    char resolved[PATH_MAX];
+    const char* real = realpath(buf, resolved);
+    if (real == nullptr) return "";
+    std::string p(real);
+#else
     const ssize_t n = readlink("/proc/self/exe", buf, sizeof(buf) - 1);
     if (n <= 0) return "";
     std::string p(buf, (size_t) n);
+#endif
     const size_t s = p.rfind('/');
     return s == std::string::npos ? std::string() : p.substr(0, s);
 #endif

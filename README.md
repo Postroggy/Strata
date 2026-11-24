@@ -85,6 +85,28 @@ SQ-20 is made for a 24 GiB graphics card, SQ-15 for 16 GiB and SQ-10 for 12 GiB.
 
 Not sure what fits? [Choose a model for your computer](docs/MODELS.md#pick-by-memory).
 
+## MemT-1.0 (this fork)
+
+This fork adds **MemT-1.0-Nano**'s Native Memory Block to the `qwen35moe` path
+(`strata-q36`): the `blk.<i>.memt.*` tensors, per-session FP32 memory state,
+query/commit control lines and `memt-memory-v1` snapshots. Through the normal
+HTTP server a model with memory reads it on every request and writes its
+completed turns into it (a reply cut by the cap, trimmed by a stop string or
+ending in a tool call is left for the next turn; `"memt_writes": false` keeps
+the reads only); `--batch` and `--mtp` keep their own per-session state. With
+`--memt-save-path DIR` the server also takes `POST /v1/memt`
+(`status` / `reset` / `save` / `load`) to keep, restore or clear the memory
+state itself (`.safetensors` plus a small JSON naming the tokens it holds). See
+[docs/MEMT.md](docs/MEMT.md) (and the English design document
+[docs/MEMT-DESIGN.md](docs/MEMT-DESIGN.md)) for the build geometry, the converter, the protocol,
+the P6 parity harness (`terminal/tools/memt_parity.py`) and the P7 speed harness
+(`terminal/tools/memt_bench.py`), and what has (and has not) been verified on a
+GPU.
+
+The MemT upstream code and its weights are PolyForm Noncommercial 1.0.0; this
+fork and any combined artifact follow that license for the MemT parts. Strata's
+own files keep their MIT license.
+
 ## Install
 
 <a id="option-a-the-strata-app"></a>

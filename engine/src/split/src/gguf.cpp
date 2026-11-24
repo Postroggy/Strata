@@ -11,6 +11,10 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#if defined(__APPLE__) && !defined(O_DIRECT)
+// macOS has no O_DIRECT; opening with 0 keeps the page-cache reader below.
+#define O_DIRECT 0
+#endif
 #endif
 
 #include <algorithm>
@@ -486,12 +490,12 @@ void Stager::run() {
         try {
             if (!buf) {
 #ifdef _WIN32
-                void* p = _aligned_malloc(std::max(buf_bytes_, PAGE), PAGE);
+                void* p = _aligned_malloc(std::max<uint64_t>(buf_bytes_, PAGE), PAGE);
                 if (!p)
                     throw std::runtime_error("stager: " + std::to_string(buf_bytes_ >> 20) + " MiB for a group's buffer");
 #else
                 void* p = nullptr;
-                if (posix_memalign(&p, PAGE, std::max(buf_bytes_, PAGE)))
+                if (posix_memalign(&p, PAGE, std::max<uint64_t>(buf_bytes_, PAGE)))
                     throw std::runtime_error("stager: " + std::to_string(buf_bytes_ >> 20) + " MiB for a group's buffer");
 #endif
                 buf = (uint8_t*) p;
@@ -549,7 +553,11 @@ void Stager::read_group(G& gr) {
                     }
                     disk_bytes_ += valid;
 #else
+#if defined(__APPLE__)
+                    if (mincore((void*) (g_.shard_base(s.shard) + fo), valid, reinterpret_cast<char*>(inc.data())) != 0)
+#else
                     if (mincore((void*) (g_.shard_base(s.shard) + fo), valid, inc.data()) != 0)
+#endif
                         throw std::runtime_error(std::string("stager: mincore: ") + std::strerror(errno));
                     bool cached = gr.spec.cached;
                     if (!cached) {

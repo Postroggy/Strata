@@ -39,6 +39,8 @@
 #include "strata/qwen35/sampling.hpp"
 #include "strata/qwen35/expert_info.hpp"
 #include "strata/qwen35/hybrid_fit.hpp"
+#include "strata/qwen35/memt_snapshot.hpp"
+#include "memt_kernels.cuh"
 #include "q36_kernels.cuh"
 #if defined(STRATA_Q36_CPU_POOL)
 #include "strata/kernels/cpu/native_expert.hpp"
@@ -51,6 +53,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cerrno>
 #include <atomic>
 #include <chrono>
 #include <cmath>
@@ -66,6 +69,7 @@
 #include <memory>
 #include <mutex>
 #include <random>
+#include <sstream>
 #include <string>
 #include <thread>
 #include <tuple>
@@ -78,6 +82,7 @@ namespace K = strata::kernels;
 namespace MMQ = strata::prefill::mmq;
 namespace PF = strata::prefill::fused;          // the grouping and the int8 sizes (shape-free)
 namespace FQ = strata::prefill::fused_q36;      // the fused kernels for Qwen3.6's shape (CUDA)
+namespace MT = strata::qwen35::memt;            // MemT-1.0's Native Memory Block (src/qwen35/memt_kernels.cu)
 
 #define CK(x)                                                                                                          \
     do {                                                                                                               \
@@ -1262,6 +1267,18 @@ struct Layer {
     // attention
     Mat wq, wk, wv, wo;
     const float *q_norm = nullptr, *k_norm = nullptr;
+    // MemT-1.0's Native Memory Block (files with memt.version only): the six
+    // blk.<i>.memt.* tensors, on the full-attention layers
+    struct Memt {
+        bool on = false;
+        Mat in_proj;                    // [N, 5*H*D + 2*R], Q8_0
+        const float* f_down = nullptr;  // [R][H*D] f32 (GGUF [R, H*D]: dim 0 contiguous)
+        const float* g_down = nullptr;  // [R][H*D] f32
+        const float* decay_scale_log = nullptr;   // [H]
+        const float* decay_bias = nullptr;        // [H*D]
+        const float* o_norm = nullptr;            // [D]
+    };
+    Memt memt;
     // MoE
     const float* router = nullptr;   // [n_expert][N] f32
     float* router_ext = nullptr;     // the same with the shared expert's gate row appended: [n_expert + 1][N]
@@ -1479,6 +1496,16 @@ bool load(const std::string& path, Model& m, std::string& err, bool want_mtp) {
             y.wo = mat(L(l, "attn_output.weight"));
             y.q_norm = f32(L(l, "attn_q_norm.weight"));
             y.k_norm = f32(L(l, "attn_k_norm.weight"));
+            if (g.has_memt && !is_mtp) {
+                // MemT-1.0's Native Memory Block: the six blk.<i>.memt.* tensors, on every full-attention layer
+                y.memt.on = true;
+                y.memt.in_proj = mat(L(l, "memt.in_proj.weight"));
+                y.memt.f_down = f32(L(l, "memt.f_down.weight"));
+                y.memt.g_down = f32(L(l, "memt.g_down.weight"));
+                y.memt.decay_scale_log = f32(L(l, "memt.decay_scale_log"));
+                y.memt.decay_bias = f32(L(l, "memt.decay_bias"));
+                y.memt.o_norm = f32(L(l, "memt.o_norm.weight"));
+            }
         }
         y.router = f32(L(l, "ffn_gate_inp.weight"));
         y.sh_gate = mat(L(l, "ffn_gate_shexp.weight"));
@@ -1752,6 +1779,8 @@ struct Engine {
     struct Sess {
         std::vector<float*> conv, S, kc, vc;
         std::vector<float*> ksc, vsc;       // --kv int8 / fp4: the K / V scales, per layer (null otherwise)
+        std::vector<float*> memt_state, memt_snap;   // MemT-1.0 memory: the FP32 state and the commit's read freeze
+        bool memt_frozen = false;
         float* hlast = nullptr;
         int64_t pos = 0;
         int32_t rdelta = 0;                 // rotary offset of the text after the last picture (see k_attn_prep)
@@ -1902,6 +1931,15 @@ struct Engine {
         return (float*) dalloc_t<char>((size_t) n_head_kv * ctx * b);
     }
 
+    // ---- MemT-1.0 memory: per state index the session's FP32 [H][D][D] state, and the commit's frozen
+    // read copy.  `memt_state` / `memt_snap` are the CURRENT session's (select() swaps them), like conv / S.
+    std::vector<float*> memt_state, memt_snap;
+    bool memt_frozen = false;      // the current session has a valid frozen read snapshot
+    bool memt_commit = false;      // this forward is a commit: read the snapshot, advance the state
+    static constexpr int kMemtTile = 256;   // tokens per scratch tile (bounds memt.proj)
+    float *memt_proj = nullptr, *memt_keff = nullptr, *memt_decay = nullptr, *memt_og = nullptr;
+    float *memt_dlat = nullptr, *memt_olat = nullptr;   // the two gate latents, gathered out of proj's wide rows
+
     void alloc_session(Sess& ss) const {
         const auto& g = m->g;
         const size_t C = (size_t) g.ssm_conv_channels;
@@ -1922,6 +1960,13 @@ struct Engine {
                 ss.ksc.push_back(nullptr);
                 ss.vsc.push_back(nullptr);
             }
+        }
+        if (m->g.has_memt) {
+            const size_t memt_bytes = (size_t) m->g.memt_heads * m->g.memt_head_dim * m->g.memt_head_dim * 4;
+            ss.memt_state.assign(m->layers.size(), nullptr);
+            ss.memt_snap.assign(m->layers.size(), nullptr);
+            for (size_t l = 0; l < m->layers.size(); ++l)
+                if (m->layers[l].memt.on) ss.memt_state[l] = dalloc(memt_bytes / 4);
         }
         if (m->has_mtp) {   // the MTP block's own K / V (an attention layer at index n_layers)
             ss.conv.push_back(nullptr);
@@ -1945,6 +1990,7 @@ struct Engine {
         Sess& ss = sess[(size_t) cur];
         conv = ss.conv; S = ss.S; kc = ss.kc; vc = ss.vc;
         ksc = ss.ksc; vsc = ss.vsc;
+        memt_state = ss.memt_state; memt_snap = ss.memt_snap; memt_frozen = ss.memt_frozen;
         hlast = ss.hlast;
         pos = ss.pos;
         ss.used = ++use_clock;
@@ -1963,6 +2009,11 @@ struct Engine {
         m = &model;
         ctx = ctx_;
         n_sess = std::max(1, std::min(n_sessions, kVerify));
+        if (model.g.has_memt && n_sess > 1 && use_graph) {
+            use_graph = false;
+            std::fprintf(stderr, "strata-q36: MemT-1.0 memory: CUDA graphs are off in a --batch %d engine (a row "
+                         "window's memory reads follow its rows' sessions)\n", n_sess);
+        }
         vision = vision_;
         tmax = std::max(tmax_, kVerify);
         const auto& g = m->g;
@@ -2088,7 +2139,8 @@ struct Engine {
             std::string gerr;
             int64_t big = 0;
             auto take = [&](const Layer& L) {
-                for (const Mat* w : {&L.qkv, &L.zg, &L.ssm_out, &L.wq, &L.wk, &L.wv, &L.wo, &L.sh_gate, &L.sh_up, &L.sh_down})
+                for (const Mat* w : {&L.qkv, &L.zg, &L.ssm_out, &L.wq, &L.wk, &L.wv, &L.wo, &L.sh_gate, &L.sh_up, &L.sh_down,
+                                     &L.memt.in_proj})
                     big = std::max<int64_t>(big, (int64_t) w->n_in * w->n_out);
             };
             for (const Layer& L : m->layers) take(L);
@@ -2144,8 +2196,11 @@ struct Engine {
             size_t n_attn = m->has_mtp ? 1 : 0, n_gdn = 0;
             for (const Layer& L : m->layers) (L.attn ? n_attn : n_gdn) += 1;
             const size_t kv_tok_1 = kv_tok_bytes((size_t) g.n_head_kv, (size_t) g.head_dim, n_attn, kv_mode);
+            size_t n_memt = 0;
+            for (const Layer& L : m->layers) n_memt += L.memt.on ? 1 : 0;
+            const size_t memt_per = (size_t) g.memt_heads * g.memt_head_dim * g.memt_head_dim * 4 * n_memt * 2;
             const size_t per = kv_tok_1 * (size_t) ctx +
-                               (size_t) g.ssm_v_heads * g.ssm_state_size * g.ssm_state_size * 4 * n_gdn;
+                               (size_t) g.ssm_v_heads * g.ssm_state_size * g.ssm_state_size * 4 * n_gdn + memt_per;
             size_t fr0 = 0, tot0 = 0;
             CK(cudaMemGetInfo(&fr0, &tot0));
             if (n_sess > 1)
@@ -2182,6 +2237,22 @@ struct Engine {
             }
         }
         for (Sess& ss : sess) alloc_session(ss);
+        if (g.has_memt) {
+            const int64_t hd = g.memt_heads * g.memt_head_dim;
+            const int64_t stride = 5 * hd + 2 * g.memt_gate_rank;
+            const size_t rows = (size_t) std::min<int64_t>(tmax, kMemtTile);
+            memt_proj = dalloc(rows * (size_t) stride);
+            memt_keff = dalloc(rows * (size_t) hd);
+            memt_decay = dalloc(rows * (size_t) hd);
+            memt_og = dalloc(rows * (size_t) hd);
+            memt_dlat = dalloc(rows * (size_t) g.memt_gate_rank);
+            memt_olat = dalloc(rows * (size_t) g.memt_gate_rank);
+            std::fprintf(stderr, "strata-q36: MemT-1.0 memory: %d layers x %.2f MiB per session (FP32 state), the same "
+                         "again once a commit has run (its frozen copy), + %.2f MiB scratch\n",
+                         (int) (g.n_layers / g.qsa_interval),
+                         (double) (g.memt_heads * g.memt_head_dim * g.memt_head_dim * 4) / (1 << 20),
+                         (double) (rows * (size_t) (stride + 3 * hd + 2 * g.memt_gate_rank) * 4) / (1 << 20));
+        }
         if (n_sess > 1) {   // the batch rows' tables: per state index the session pointers, on the device
             const size_t ns = sess[0].conv.size();
             std::vector<float*> hc(ns * (size_t) n_sess), hs(hc), hk(hc), hv(hc), hks(hc), hvs(hc);
@@ -2266,6 +2337,10 @@ struct Engine {
             if (conv[l]) CK(cudaMemsetAsync(conv[l], 0, (size_t) g.ssm_conv_channels * (g.ssm_d_conv - 1) * 4, st));
             if (S[l]) CK(cudaMemsetAsync(S[l], 0, (size_t) g.ssm_v_heads * g.ssm_state_size * g.ssm_state_size * 4, st));
         }
+        if (g.has_memt) {   // the memory is the conversation-independent store: a new prompt resets GDN / K / V, not it
+            memt_frozen = false;
+            sess[(size_t) cur].memt_frozen = false;
+        }
         CK(cudaMemsetAsync(hlast, 0, (size_t) g.n_embd * 4, st));
         CK(cudaStreamSynchronize(st));
         pos = 0;
@@ -2275,6 +2350,136 @@ struct Engine {
         s0.ckpts.clear();
         s0.ckpt_next = 0;
         s0.ckpt_last_k = -1;
+    }
+
+    /// A memory control changed what a prompt's hidden state depends on: drop the
+    /// session's conversation state (live tokens, pictures, GDN checkpoints) so the
+    /// next request neither reuses it nor resumes from it.
+    void memt_forget_state() {
+        Sess& ss = sess[(size_t) cur];
+        CK(cudaStreamSynchronize(st));   // nothing queued may still reference the pinned checkpoint ring we drop below
+        ss.live.clear();
+        ss.imgs.clear();
+        ss.ckpts.clear();
+        ss.ckpt_next = 0;
+        ss.ckpt_last_k = -1;
+        // the conversation is gone, so its position is 0 too. reset() would do this on the
+        // next request anyway (live is empty, so reuse is 0); doing it here keeps the
+        // invariant local, so nothing between the control line and that request can read a
+        // stale position or rotary delta.
+        pos = 0;
+        ss.pos = 0;
+        set_delta(0);
+    }
+
+    /// Zero the current session's memory (MEMRESET): a new, empty memory store.
+    void memt_clear() {
+        if (!m->g.has_memt) return;
+        const size_t bytes = (size_t) m->g.memt_heads * m->g.memt_head_dim * m->g.memt_head_dim * 4;
+        for (float* p : memt_state)
+            if (p) CK(cudaMemsetAsync(p, 0, bytes, st));
+        CK(cudaStreamSynchronize(st));
+        memt_frozen = false;
+        sess[(size_t) cur].memt_frozen = false;
+        memt_forget_state();
+    }
+
+    /// Start a commit: every token of the request reads the state it began with.
+    /// The frozen copy survives across the request's prompt chunks; memt_end_commit
+    /// publishes (the state has been advanced in place) and drops it.
+    void memt_commit_begin() {
+        if (!m->g.has_memt) return;
+        Sess& ss = sess[(size_t) cur];
+        const size_t bytes = (size_t) m->g.memt_heads * m->g.memt_head_dim * m->g.memt_head_dim * 4;
+        if (!ss.memt_frozen) {
+            for (size_t l = 0; l < ss.memt_state.size(); ++l) {
+                if (ss.memt_state[l] == nullptr) continue;
+                if (ss.memt_snap[l] == nullptr) CK(cudaMalloc(&ss.memt_snap[l], bytes));
+                CK(cudaMemcpyAsync(ss.memt_snap[l], ss.memt_state[l], bytes, cudaMemcpyDeviceToDevice, st));
+            }
+            CK(cudaStreamSynchronize(st));
+            ss.memt_frozen = true;
+        }
+        memt_snap = ss.memt_snap;   // the pointers may be new
+        memt_frozen = true;
+        memt_commit = true;
+    }
+    void memt_end_commit() {
+        memt_commit = false;
+        memt_frozen = false;
+        sess[(size_t) cur].memt_frozen = false;
+    }
+
+    /// Write the session's memory as a memt-memory-v1 snapshot (path, identity).
+    bool memt_export(const std::string& path, const std::string& identity, bool overwrite, std::string& err) {
+        if (!m->g.has_memt) { err = "this model has no MemT memory"; return false; }
+        const int64_t H = m->g.memt_heads, D = m->g.memt_head_dim;
+        const size_t bytes = (size_t) H * D * D * 4;
+        std::vector<int> layers;
+        std::vector<std::vector<float>> host;
+        std::vector<const float*> data;
+        host.reserve(memt_state.size());
+        data.reserve(memt_state.size());
+        for (size_t l = 0; l < memt_state.size(); ++l) {
+            if (memt_state[l] == nullptr) continue;
+            host.emplace_back(bytes / 4);
+            CK(cudaMemcpyAsync(host.back().data(), memt_state[l], bytes, cudaMemcpyDeviceToHost, st));
+            layers.push_back((int) l);
+            data.push_back(host.back().data());
+        }
+        CK(cudaStreamSynchronize(st));   // st is a non-blocking stream: a plain cudaMemcpy would not order behind it
+        try {
+            MT::save_snapshot(path, MT::encode_snapshot(identity, layers, data, H, D), overwrite);
+        } catch (const std::exception& e) {
+            err = e.what();
+            return false;
+        }
+        return true;
+    }
+
+    /// Load a memt-memory-v1 snapshot into the session (path, identity).  The file
+    /// must carry exactly this model's memory layers, shape and dtype.
+    bool memt_import(const std::string& path, const std::string& identity, std::string& err) {
+        if (!m->g.has_memt) { err = "this model has no MemT memory"; return false; }
+        const int64_t H = m->g.memt_heads, D = m->g.memt_head_dim;
+        std::vector<MT::SnapshotLayer> layers;
+        try {
+            layers = MT::decode_snapshot(MT::load_snapshot(path), identity, H, D);
+        } catch (const std::exception& e) {
+            err = e.what();
+            return false;
+        }
+        int want = 0;
+        for (float* p : memt_state)
+            if (p) ++want;
+        if (layers.empty()) {   // memt_sglang's "no memory" snapshot: an empty store
+            const size_t bytes = (size_t) H * D * D * 4;
+            for (float* p : memt_state)
+                if (p) CK(cudaMemsetAsync(p, 0, bytes, st));
+            CK(cudaStreamSynchronize(st));
+            memt_frozen = false;
+            sess[(size_t) cur].memt_frozen = false;
+            memt_forget_state();
+            return true;
+        }
+        if ((int) layers.size() != want) {
+            err = "the snapshot has " + std::to_string(layers.size()) + " memory layers, this model " + std::to_string(want);
+            return false;
+        }
+        for (const MT::SnapshotLayer& state : layers) {
+            if (state.layer < 0 || (size_t) state.layer >= memt_state.size() || memt_state[(size_t) state.layer] == nullptr) {
+                err = "the snapshot has memory." + std::to_string(state.layer) + ", which this model does not carry";
+                return false;
+            }
+        }
+        for (const MT::SnapshotLayer& state : layers)
+            CK(cudaMemcpyAsync(memt_state[(size_t) state.layer], state.values.data(), state.values.size() * 4,
+                               cudaMemcpyHostToDevice, st));
+        CK(cudaStreamSynchronize(st));
+        memt_frozen = false;
+        sess[(size_t) cur].memt_frozen = false;
+        memt_forget_state();
+        return true;
     }
 
     /// The newest GDN checkpoint of session ss at or below `l` (its position), or -1.
@@ -2406,6 +2611,16 @@ struct Engine {
     bool fast_k = std::getenv("STRATA_Q36_OLD_KERNELS") == nullptr;
     bool verify_k = std::getenv("STRATA_Q36_VERIFY") != nullptr;
     float* vbuf = nullptr;                       // verify scratch
+    size_t vbuf_floats = 0;
+    /// The verify scratch, at least `floats` wide.  Debug mode only: growing it
+    /// waits for the stream and frees the old buffer (a shape above 16384 rows).
+    void vbuf_ensure(size_t floats) {
+        if (vbuf_floats >= floats) return;
+        CK(cudaStreamSynchronize(st));
+        if (vbuf) CK(cudaFree(vbuf));
+        CK(cudaMalloc((void**) &vbuf, floats * 4));
+        vbuf_floats = floats;
+    }
     long long v_calls = 0, v_bad = 0;
     std::map<std::string, long long> v_by;   // mismatches per check
     void verify_cmp(const char* what, const float* a, const float* b, size_t n, const std::string& tag = "") {
@@ -2442,7 +2657,7 @@ struct Engine {
         switch (T) { Q36_Q8(1) Q36_Q8(2) Q36_Q8(3) Q36_Q8(4) Q36_Q8(5) Q36_Q8(6) Q36_Q8(7) Q36_Q8(8) }
 #undef Q36_Q8
         if (verify_k) {
-            if (!vbuf) CK(cudaMalloc((void**) &vbuf, (size_t) 8 * 16384 * 4));
+            vbuf_ensure((size_t) 8 * (size_t) w.n_out);
             const size_t qb = K::native_q8_1_bytes(w.n_in, 1);
             for (int c0 = 0; c0 < T; c0 += 8) {
                 const int nc = std::min(8, T - c0);
@@ -2552,7 +2767,7 @@ struct Engine {
         switch (T) { Q36_SH(1) Q36_SH(2) Q36_SH(3) Q36_SH(4) }
 #undef Q36_SH
         if (verify_k) {
-            if (!vbuf) CK(cudaMalloc((void**) &vbuf, (size_t) 8 * 16384 * 4));
+            vbuf_ensure((size_t) 8 * 16384);
             if (!vq) CK(cudaMalloc(&vq, K::native_q8_1_bytes(m->g.n_embd, 1) * 8));
             float* vg = vbuf;
             float* vu = vbuf + (size_t) 8 * FS;
@@ -2636,7 +2851,7 @@ struct Engine {
         grouped_by_route = true;
         if (verify_k) {
             // the old top-k into scratch, the ids / weights compared, then the old grouping of the new ids
-            if (!vbuf) CK(cudaMalloc((void**) &vbuf, (size_t) 8 * 16384 * 4));
+            vbuf_ensure((size_t) 8 * 16384);
             int32_t* vid = (int32_t*) (vbuf + 8 * 8192);
             float* vw = vbuf + 8 * 8192 + 64;
             K::native_router_topk(logits_r, vid, vw, 256, Kp, T, st);
@@ -2703,6 +2918,62 @@ struct Engine {
             K::native_mmvq(w.type, w.d, (const char*) q + (size_t) c0 * qb, out + (size_t) c0 * w.n_out, w.n_in,
                            w.n_out, nc, st);
         }
+    }
+
+    /// MemT-1.0's memory over T rows: reads into att, and with write_state advances that state.
+    void memt_rows(const Layer& L, const float* hin, float* att, int T, const float* read_state, float* write_state) {
+        const auto& g = m->g;
+        const int H = (int) g.memt_heads, D = (int) g.memt_head_dim, R = (int) g.memt_gate_rank;
+        const int64_t hd = (int64_t) H * D;
+        const int64_t stride = 5 * hd + 2 * R;
+        for (int t0 = 0; t0 < T; t0 += kMemtTile) {
+            const int n = std::min<int>(kMemtTile, T - t0);
+            prep(hin + (size_t) t0 * g.n_embd, (int) g.n_embd, n, xq);
+            apply(L.memt.in_proj, xq, memt_proj, n);
+            // the gate latents sit inside proj's wide rows; gather them into
+            // contiguous [n][R] blocks for the two FP32 GEMMs
+            MT::latents(memt_proj, memt_dlat, memt_olat, n, stride, hd, R, st);
+            f32mm(L.memt.f_down, memt_dlat, memt_decay, R, (int) hd, n);
+            f32mm(L.memt.g_down, memt_olat, memt_og, R, (int) hd, n);
+            MT::gates(memt_decay, L.memt.decay_bias, L.memt.decay_scale_log, memt_decay, n, H, D, st);
+            MT::read(memt_proj, memt_og, L.memt.o_norm, read_state, att + (size_t) t0 * hd, n, H, D, stride,
+                       (float) g.memt_eps, (float) g.memt_softcap, st);
+            if (write_state != nullptr) {
+                MT::key_effective(memt_proj, memt_keff, n, H, D, stride, st);
+                MT::update(memt_proj, memt_keff, memt_decay, write_state, n, H, D, stride, st);
+            }
+        }
+    }
+
+    /// MemT-1.0's memory for one layer: a query reads the live state, a commit the frozen copy; a row window reads
+    /// each row's own session state.
+    void memt_layer(const Layer& L, size_t li, int T, float* att, bool verify) {
+        const auto& g = m->g;
+        const int64_t hd = (int64_t) g.memt_heads * g.memt_head_dim;
+        if (rows_mode) {
+            if (memt_commit) {
+                std::fprintf(stderr, "strata-q36: MemT commit in a batched row window (internal error)\n");
+                std::exit(1);
+            }
+            for (int r = 0; r < T; ++r) {
+                const int slot = hrow[16 + r];
+                if (slot < 0 || slot >= n_sess || li >= sess[(size_t) slot].memt_state.size() ||
+                    sess[(size_t) slot].memt_state[li] == nullptr) {
+                    std::fprintf(stderr, "strata-q36: MemT row %d has no state for session %d (internal error)\n", r, slot);
+                    std::exit(1);
+                }
+                memt_rows(L, h + (size_t) r * g.n_embd, att + (size_t) r * hd, 1,
+                          sess[(size_t) slot].memt_state[li], nullptr);
+            }
+            return;
+        }
+        if (memt_commit && memt_snap[li] == nullptr) {
+            std::fprintf(stderr, "strata-q36: MemT commit without a frozen read state (internal error)\n");
+            std::exit(1);
+        }
+        const float* read_state = memt_commit ? memt_snap[li] : memt_state[li];
+        float* write_state = (memt_commit && !verify) ? memt_state[li] : nullptr;
+        memt_rows(L, h, att, T, read_state, write_state);
     }
 
     /// One layer for T rows: x (the residual) += mixer(h); then MoE; x += moe; `hout` = rms(x) * wn (the next norm).
@@ -2889,6 +3160,7 @@ struct Engine {
                     k_attn_merge<<<nt * H, HD, 0, st>>>(pacc, pm, pl, gate, dpos, t0, H, n_chunk, att, rs);
                 }
             }
+            if (L.memt.on) memt_layer(L, li, T, att, verify);
             mm(L.wo, att, y, T);
         }
         add_rms_post(L, T);
@@ -3704,8 +3976,9 @@ struct Engine {
             CK(cudaMemcpyAsync(pos0, hpin + 1, 4, cudaMemcpyHostToDevice, st));
             chunk_pictures(pos, 1);
             rows_deferred = true;
-            // a prompt cell of a picture request (its rotary position is in the table, its row a picture's) runs eagerly
-            if (mtab_now || map_on) forward(1, pos, 1, false, false);
+            // a prompt cell of a picture request (its rotary position is in the table, its row a picture's) runs eagerly;
+            // so does a one-token commit, whose read state and state update the query graph does not carry
+            if (mtab_now || map_on || memt_commit) forward(1, pos, 1, false, false);
             else graph_run(gs().g1, [&] { forward(1, pos, 1, use_graph, false); });
             mtab_now = nullptr;
             map_on = false;
@@ -3934,6 +4207,18 @@ struct Engine {
                                          (size_t) g.n_head_kv, cudaMemcpyDeviceToDevice, st));
                 }
             }
+        }
+        if (g.has_memt) {
+            const size_t memt_bytes = (size_t) g.memt_heads * g.memt_head_dim * g.memt_head_dim * 4;
+            for (size_t l = 0; l < a.memt_state.size(); ++l) {
+                if (a.memt_state[l] == nullptr) continue;
+                CK(cudaMemcpyAsync(b.memt_state[l], a.memt_state[l], memt_bytes, cudaMemcpyDeviceToDevice, st));
+                if (a.memt_snap[l] != nullptr) {
+                    if (b.memt_snap[l] == nullptr) CK(cudaMalloc(&b.memt_snap[l], memt_bytes));
+                    CK(cudaMemcpyAsync(b.memt_snap[l], a.memt_snap[l], memt_bytes, cudaMemcpyDeviceToDevice, st));
+                }
+            }
+            b.memt_frozen = a.memt_frozen;
         }
         CK(cudaMemcpyAsync(b.hlast, a.hlast, (size_t) g.n_embd * 4, cudaMemcpyDeviceToDevice, st));
         CK(cudaStreamSynchronize(st));
@@ -4601,6 +4886,26 @@ int sample(std::vector<float>& lg, const Sampling& s, const std::vector<int32_t>
     return idx[keep - 1];
 }
 
+/// The whole string as comma/space separated token ids; false on any other
+/// character, an overflow, or a negative value.  (parse_ids stops at the first
+/// unparsable token, which is fine for a prompt that the tokenizer produced but
+/// not for a control line whose truncation would silently commit less.)
+bool parse_ids_strict(const char* s, std::vector<int32_t>& out) {
+    out.clear();
+    while (*s) {
+        while (*s == ',' || *s == ' ' || *s == '\t') ++s;
+        if (!*s) break;
+        char* e = nullptr;
+        errno = 0;
+        const long v = std::strtol(s, &e, 10);
+        if (e == s || errno == ERANGE || v < 0 || v > 0x7fffffffL) return false;
+        out.push_back((int32_t) v);
+        s = e;
+        if (*s != '\0' && *s != ',' && *s != ' ' && *s != '\t') return false;
+    }
+    return !out.empty();
+}
+
 std::vector<int32_t> parse_ids(const char* s) {
     std::vector<int32_t> v;
     while (*s) {
@@ -5001,6 +5306,116 @@ struct Serve {
         return best >= 0 ? best : free_empty >= 0 ? free_empty : lru;
     }
 
+    /// MemT-1.0's control lines (one request at a time, like GEN):
+    ///   MEMQUERY <max_new> [key=value ...] <id,id,...>  a query: read the published memory, never move it
+    ///   MEMCOMMIT <id,id,...>                           write the prompt into memory, no generation
+    ///                                                   (MEMCHUNK <done> <n> per chunk, then MEMDONE <read> <n> <ms>)
+    ///   MEMSELECT <session>                             the session the next MEMCOMMIT / MEMSNAP / MEMLOAD /
+    ///                                                   MEMRESET / MEMFORGET act on (MEMQUERY is a request: it picks its own)
+    ///   MEMSNAP <path> <identity> [overwrite]           export the session's memory state
+    ///   MEMLOAD <path> <identity>                       import it
+    ///   MEMRESET                                        zero the session's memory state
+    ///   MEMFORGET                                       drop the cached prompt state (KV / GDN / checkpoints), keep the memory
+    void mem_request(const std::string& line) {
+        if (!E.m->g.has_memt) {
+            std::printf("ERR this model has no MemT memory\n");
+            std::fflush(stdout);
+            return;
+        }
+        if (n_active > 0) {   // a memory control changes the state a running slot is reading
+            std::printf("ERR MEM* needs an idle engine (a batch slot is decoding)\n");
+            std::fflush(stdout);
+            return;
+        }
+        const size_t sp = line.find(' ');
+        const std::string op = sp == std::string::npos ? line : line.substr(0, sp);
+        const std::string rest = sp == std::string::npos ? std::string() : line.substr(sp + 1);
+        if (op == "MEMQUERY") {
+            E.memt_commit = false;
+            request("GEN " + rest);
+            return;
+        }
+        if (op == "MEMSELECT") {
+            const std::string tok = rest.substr(0, rest.find(' '));
+            char* end = nullptr;
+            const long slot = tok.empty() ? -1 : std::strtol(tok.c_str(), &end, 10);
+            if (tok.empty() || end != tok.c_str() + tok.size() || slot < 0 || slot >= E.n_sess) {
+                std::printf("ERR MEMSELECT: a session 0..%d is required\n", E.n_sess - 1);
+                std::fflush(stdout);
+                return;
+            }
+            E.select(slot);
+            std::printf("MEMSELECT %d OK\n", slot);
+            std::fflush(stdout);
+            return;
+        }
+        if (op == "MEMRESET") {
+            E.memt_clear();
+            std::printf("MEMRESET OK\n");
+            std::fflush(stdout);
+            return;
+        }
+        if (op == "MEMFORGET") {
+            E.memt_forget_state();
+            std::printf("MEMFORGET OK\n");
+            std::fflush(stdout);
+            return;
+        }
+        if (op == "MEMSNAP" || op == "MEMLOAD") {
+            std::istringstream in(rest);
+            std::string path, identity, extra;
+            in >> path >> identity >> extra;
+            if (path.empty() || identity.empty()) {
+                std::printf("ERR expected: %s <path> <identity>%s (no spaces in path or identity)\n", op.c_str(),
+                            op == "MEMSNAP" ? " [overwrite]" : "");
+                std::fflush(stdout);
+                return;
+            }
+            std::string err;
+            const bool ok = op == "MEMSNAP" ? E.memt_export(path, identity, extra == "overwrite", err)
+                                            : E.memt_import(path, identity, err);
+            std::printf(ok ? "%s OK\n" : "ERR %s\n", ok ? op.c_str() : err.c_str());
+            std::fflush(stdout);
+            return;
+        }
+        if (op == "MEMCOMMIT") {
+            std::vector<int32_t> ids;
+            if (!parse_ids_strict(rest.c_str(), ids) || (int64_t) ids.size() > E.ctx) {
+                std::printf("ERR MEMCOMMIT: a prompt of 1..%d comma-separated ids is required\n", E.ctx);
+                std::fflush(stdout);
+                return;
+            }
+            for (const int32_t t : ids)
+                if (t < 0 || t >= (int32_t) E.m->g.n_vocab) {
+                    std::printf("ERR a token id is outside the vocabulary\n");
+                    std::fflush(stdout);
+                    return;
+                }
+            Engine::Sess& ss = E.sess[(size_t) E.cur];
+            E.reset();   // GDN / K / V fresh: the commit reads the prompt from the start; the memory itself stays
+            ss.live.clear();
+            ss.imgs.clear();
+            E.clear_images();
+            E.memt_commit_begin();
+            const auto t0 = Clock::now();
+            const int64_t got = E.process(ids.data(), (int64_t) ids.size(), [&](int64_t done) {
+                std::printf("MEMCHUNK %lld %lld\n", (long long) done, (long long) ids.size());
+                std::fflush(stdout);
+            });
+            E.memt_end_commit();
+            CK(cudaStreamSynchronize(E.st));   // MEMDONE means the update is in the state, not just queued
+            E.sess[(size_t) E.cur].pos = E.pos;
+            // the prompt's hidden states came from the pre-commit snapshot; they are
+            // not a query's prefix, so the session does not keep them for reuse
+            E.memt_forget_state();
+            std::printf("MEMDONE %lld %lld %.1f\n", (long long) got, (long long) ids.size(), ms_since(t0));
+            std::fflush(stdout);
+            return;
+        }
+        std::printf("ERR expected: MEMQUERY / MEMCOMMIT / MEMSELECT / MEMSNAP / MEMLOAD / MEMRESET / MEMFORGET\n");
+        std::fflush(stdout);
+    }
+
     void request(const std::string& line) {
         const bool adm = line[0] == 'B';
         const bool geni = line.rfind(adm ? "BGENI " : "GENI ", 0) == 0;
@@ -5280,8 +5695,9 @@ struct Serve {
 
     int run() {
         if (E.n_sess > 1) std::printf("INFO batch_slots=%d slot_cache=1\n", E.n_sess);
+        if (E.m->g.memt_identity[0] != '\0') std::printf("INFO memt_identity=%s\n", E.m->g.memt_identity);
         if (E.expert_info.experts > 0) std::fputs(strata::qwen35::expert_info_line(E.expert_info).c_str(), stdout);   // #5012
-        std::printf("READY %d stop\n", E.ctx);
+        std::printf("READY %d stop%s\n", E.ctx, E.m->g.has_memt ? " memt" : "");
         std::fflush(stdout);
         std::thread reader([&] {
             std::string l;
@@ -5318,6 +5734,8 @@ struct Serve {
                 if (b >= 0 && b < (int) slots.size()) slots[(size_t) b].stop = true;
             } else if (line.rfind("BYIELD", 0) == 0) {
                 // (a read that has ended)
+            } else if (line.rfind("MEM", 0) == 0) {
+                mem_request(line);
             } else if (line.rfind("GEN", 0) == 0 || line.rfind("BGEN", 0) == 0) {
                 request(line);
             } else {

@@ -180,17 +180,17 @@ def slot_filename_problem(name) -> str | None:
     return None
 
 
-def slot_save_dir(value, base: str | None = None) -> str:
-    """The slot save path as one absolute, normalized directory (relative to `base`, else the server's working
-    directory), created private to this user when missing.  ValueError for anything else."""
+def slot_save_dir(value, base: str | None = None, what: str = "slot_save_path") -> str:
+    """A save path as one absolute, normalized directory (relative to `base`, else the server's working directory),
+    created private to this user when missing.  ValueError for anything else."""
     if not isinstance(value, str) or not value.strip():
-        raise ValueError("slot_save_path must be a directory path (a string)")
+        raise ValueError(f"{what} must be a directory path (a string)")
     if any(ord(c) < 32 for c in value):
-        raise ValueError("slot_save_path must not contain control characters")
+        raise ValueError(f"{what} must not contain control characters")
     path = os.path.abspath(os.path.join(base, value) if base and not os.path.isabs(value) else value)
     os.makedirs(path, mode=0o700, exist_ok=True)
     if not os.path.isdir(path):
-        raise ValueError(f"slot_save_path {path} is not a directory")
+        raise ValueError(f"{what} {path} is not a directory")
     return path
 
 
