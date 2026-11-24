@@ -486,6 +486,10 @@ bool load(const std::string& path, Model& m, std::string& err) {
     }
     size_t checked = 0;
     if (!strata::core::check_gguf_layout(gm, m.g, err, &checked)) return false;
+    if (m.g.has_memt) {
+        err = "MemT memory is present but this reference path does not execute it";
+        return false;
+    }
     const std::string p = "qwen35moe.";
     if (const strata::MetaValue* v = gm.meta().get(p + "attention.layer_norm_rms_epsilon")) m.eps = (float) v->num();
     if (const strata::MetaValue* v = gm.meta().get(p + "rope.freq_base")) m.rope_base = (float) v->num();

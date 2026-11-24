@@ -18,6 +18,7 @@
 #include "strata/artifact/model_family.hpp"
 #include "strata/core/geometry.hpp"
 
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <set>
@@ -89,6 +90,69 @@ inline bool geometry_from_gguf(const strata::GgufFile& meta, ModelGeometry& g, i
         err = buf;
         return false;
     };
+    // MemT-1.0 memory: present only when the file carries memt.version.  The
+    // six blk.<i>.memt.* tensors are runtime-sized, so these fields are not in
+    // compiled_geometry_mismatch.
+    if (const strata::MetaValue* version = meta.get("memt.version")) {
+        if (!strata::meta_is_int_type(version->type) || (int64_t) version->u != 1)
+            return bad("memt.version must be the integer 1");
+        if (family != strata::ModelFamily::Qwen35Moe)
+            return bad("memt.* is only supported on qwen35moe");
+        g.has_memt = true;
+        auto memt_int = [&](const char* key, int64_t& dst) {
+            const strata::MetaValue* v = meta.get(key);
+            if (!v || !strata::meta_is_int_type(v->type) || (int64_t) v->u <= 0) {
+                err = std::string("memt: ") + key + " is missing, not an integer, or not positive";
+                return false;
+            }
+            dst = (int64_t) v->u;
+            return true;
+        };
+        if (!memt_int("memt.head_count", g.memt_heads)) return false;
+        if (!memt_int("memt.head_dim", g.memt_head_dim)) return false;
+        if (!memt_int("memt.gate_rank", g.memt_gate_rank)) return false;
+        if (!memt_int("memt.chunk_tokens", g.memt_chunk_tokens)) return false;
+        if (g.memt_heads != g.n_head)
+            return bad("memt.head_count != attention.head_count");
+        if (g.memt_head_dim != g.head_dim)
+            return bad("memt.head_dim != attention.key_length");
+        if (g.memt_gate_rank != g.head_dim)
+            return bad("memt.gate_rank != attention.key_length");
+        auto memt_float = [&](const char* key, double& dst) {
+            const strata::MetaValue* v = meta.get(key);
+            if (!v || !v->is_num() || !std::isfinite(v->num()) || v->num() <= 0.0) {
+                err = std::string("memt: ") + key + " is missing, not a number, or not positive";
+                return false;
+            }
+            dst = v->num();
+            return true;
+        };
+        if (!memt_float("memt.output_gate_softcap_limit", g.memt_softcap)) return false;
+        if (!memt_float("memt.rms_norm_epsilon", g.memt_eps)) return false;
+        if (const strata::MetaValue* fi = meta.get("memt.full_attention_interval")) {
+            if (!strata::meta_is_int_type(fi->type) || (int64_t) fi->u != g.qsa_interval)
+                return bad("memt.full_attention_interval != qwen35moe.full_attention_interval");
+        }
+        if (const strata::MetaValue* id = meta.get("memt.identity")) {   // the snapshot identity the converter wrote
+            const std::string& s = id->s;
+            const bool hex = id->type == strata::MetaType::STRING && s.size() == 64 &&
+                             s.find_first_not_of("0123456789abcdefABCDEF") == std::string::npos;
+            if (!hex)
+                return bad("memt.identity must be 64 hex characters (a memt-memory-v1 identity)");
+            std::snprintf(g.memt_identity, sizeof g.memt_identity, "%s", s.c_str());
+        }
+        if (const strata::MetaValue* ml = meta.get("memt.memory_layers")) {
+            const int64_t want = (g.n_layers + g.qsa_interval - 1) / g.qsa_interval;
+            if (ml->type != strata::MetaType::ARRAY || !strata::meta_is_int_type(ml->elem) ||
+                ml->count != (uint64_t) want)
+                return bad("memt.memory_layers must list the full-attention layers");
+            for (int64_t i = 0; i < want; ++i) {
+                const int64_t expect = (i + 1) * g.qsa_interval - 1;
+                if ((int64_t) ml->items[(size_t) i].u != expect)
+                    return bad("memt.memory_layers does not match full_attention_interval");
+            }
+        }
+    }
     if (g.n_layers <= 0 || g.n_embd <= 0 || g.n_head <= 0 || g.n_head_kv <= 0 || g.head_dim <= 0 || g.n_expert <= 0 ||
         top_k <= 0 || top_k > g.n_expert || g.n_ff <= 0 || g.ssm_state_size <= 0 || g.ssm_k_heads <= 0 ||
         g.ssm_v_heads <= 0 || g.ssm_d_conv <= 0 || g.qsa_interval < 2)
@@ -207,6 +271,16 @@ inline std::vector<TensorWant> layer_tensors(const ModelGeometry& g, int64_t lay
         add("attn_output.weight", {g.n_head * g.head_dim, N});
         add("attn_q_norm.weight", {g.head_dim});
         add("attn_k_norm.weight", {g.head_dim});
+        if (g.has_memt && kind == LayerKind::Attention) {
+            // the released memory block: q|k|v|erase|write|decay_latent|og_latent
+            const int64_t MH = g.memt_heads, MD = g.memt_head_dim, GR = g.memt_gate_rank;
+            add("memt.in_proj.weight", {N, 5 * MH * MD + 2 * GR});
+            add("memt.f_down.weight", {GR, MH * MD});
+            add("memt.g_down.weight", {GR, MH * MD});
+            add("memt.decay_scale_log", {MH});
+            add("memt.decay_bias", {MH * MD});
+            add("memt.o_norm.weight", {MD});
+        }
         if (g.has_indexer() && kind == LayerKind::Attention) {
             // `q_proj` is the QUERY count, `k_proj` the KEY width (round 194: they are different numbers)
             add("indexer.q_proj.weight", {N, g.idx_q_heads * g.idx_key_dim});

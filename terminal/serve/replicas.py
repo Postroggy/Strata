@@ -358,6 +358,30 @@ class ReplicaEngine:
     def current(self):
         return getattr(self.tl, "cur", None) or self.engines[0]
 
+    @property
+    def current_index(self) -> int:
+        c = self.current
+        for k, e in enumerate(self.engines):
+            if e is c:
+                return k
+        return 0
+
+    MEMT_LOCK_WAIT_S = 0.5
+
+    def memt_commit(self, ids) -> dict:
+        """`MEMCOMMIT` on the replica this request ran on, under its run lock; ValueError when that engine is busy."""
+        k = self.current_index
+        e = self.engines[k]
+        if int(getattr(e, "batch", 0) or 0):
+            raise ValueError("a replica with batch slots runs requests together; a memory commit needs it idle")
+        lock = self.run_locks[k]
+        if not lock.acquire(timeout=self.MEMT_LOCK_WAIT_S):
+            raise ValueError("that replica is busy with another request; this turn is not written")
+        try:
+            return e.memt_commit(ids)
+        finally:
+            lock.release()
+
     def __getattr__(self, name):
         if name in self.NOT_HERE or name.startswith("__"):
             raise AttributeError(name)
