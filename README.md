@@ -101,7 +101,10 @@ state itself (`.safetensors` plus a small JSON naming the tokens it holds). See
 [docs/MEMT-DESIGN.md](docs/MEMT-DESIGN.md)) for the build geometry, the converter, the protocol,
 the P6 parity harness (`terminal/tools/memt_parity.py`) and the P7 speed harness
 (`terminal/tools/memt_bench.py`), and what has (and has not) been verified on a
-GPU.
+GPU. For a GPU host,
+[docs/MEMT-GPU-RUNBOOK.md](docs/MEMT-GPU-RUNBOOK.md) is the step-by-step
+runbook: machine prerequisites, paths, commands and what to check when a step
+fails.
 
 The MemT upstream code and its weights are PolyForm Noncommercial 1.0.0; this
 fork and any combined artifact follow that license for the MemT parts. Strata's

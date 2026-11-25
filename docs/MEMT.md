@@ -11,6 +11,11 @@ their math/indexing is checked on the CPU (`memt_kernels_cpu_test`), but no buil
 has run on a GPU and no real Nano checkpoint has been converted here (the two open
 gates). Do not read this document as a speed claim.
 
+On a GPU host, follow [MEMT-GPU-RUNBOOK.md](MEMT-GPU-RUNBOOK.md): machine
+prerequisites, where the weights and artefacts go, the build/conversion/serve
+commands, the three judgment points (load, P6, P7) and what to tune when the
+card cannot hold every routed expert.
+
 ## What the memory block is
 
 Every full-attention layer (`blk.3`, `blk.7`, …, `blk.39`) carries six tensors:
@@ -38,9 +43,9 @@ to the sample's block. A query never moves the state; a commit freezes a copy at
 its start, reads that copy for all tokens, and advances the live state in order
 (the 2048-token write events only bound memt_sglang's internal WY chunking).
 
-One session runs at a time: `--batch` above 1 and `--mtp` above 0 are refused for
-MemT files (a memory read/commit is a per-request control operation, and the
-batched verify windows do not carry the memory block).
+`--batch` and `--mtp` are allowed with a MemT file: the memory is per session, and
+a row window (a batch step, an MTP verify window) reads each row's own session
+state (§"Memory state through `terminal/serve/server.py`" below).
 
 ## Build
 
@@ -54,9 +59,13 @@ compile-time constraint shared kernels add is
 which Nano has).
 
 ```sh
-cmake -S . -B build/cuda -DSTRATA_ENABLE_CUDA=ON
+cmake -S engine -B build/cuda -DSTRATA_ENABLE_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=native
 cmake --build build/cuda --target strata-q36 -j
 ```
+
+The source directory is `engine`, not the repository root. `native` builds for the
+cards in this machine; without any architecture option the build is sm_120 (RTX 50)
+only and will not run on an RTX 40 card — pass `89` for a 4090.
 
 `strata-q36:load` still refuses a shape its kernels do not take (head_dim other
 than 256, state other than 128, conv other than 4, more than 512 experts, top-k
@@ -290,11 +299,19 @@ then:
 ```sh
 python terminal/tools/memt_parity.py \
     --ref-url http://127.0.0.1:30000 --ref-state-dir /data/memt-state \
-    --engine ./strata-q36 --engine-arg --model --engine-arg /models/MemT-1.0-Nano.memt.gguf \
+    --engine ./build/cuda/strata-q36 \
+    --engine-arg=--model --engine-arg=/models/MemT-1.0-Nano.memt.gguf --engine-arg=--serve \
     --engine-model-dir /models/MemT-1.0-Nano \
     --commit evidence.ids --prompt q1.ids --prompt q2.ids \
-    --outdir runs/p6 --max-new 32 --min-cosine 0.999
+    --outdir runs/p6 --max-new 32 --min-cosine 0.999 --ready-timeout 1200
 ```
+
+`--engine-arg=` needs the equals form: argparse takes a value that starts with
+`--` as another option, so `--engine-arg --model` fails with "expected one
+argument". `--serve` is part of the engine's args because only serve mode prints
+`READY`; without it the engine runs as a `--tokens` invocation and exits.
+`--ready-timeout` bounds the reference's readiness (the engine is waited on
+without a timeout), and its 30 s default is shorter than a BF16 load.
 
 `evidence.ids`, `q1.ids`, … are token-id files (JSON list, `{"ids": [...]}`, or
 comma/space separated). The procedure: the reference commits from an empty
@@ -327,8 +344,9 @@ discarded warmup, then `--runs` measured requests:
 ```sh
 python terminal/tools/memt_bench.py --side both \
     --ref-url http://127.0.0.1:30000 \
-    --engine ./strata-q36 --engine-arg --model --engine-arg /models/MemT-1.0-Nano.memt.gguf \
-    --prompt q1.ids --max-new 128 --runs 3 --outdir runs/p7
+    --engine ./build/cuda/strata-q36 \
+    --engine-arg=--model --engine-arg=/models/MemT-1.0-Nano.memt.gguf --engine-arg=--serve \
+    --prompt q1.ids --max-new 128 --runs 3 --outdir runs/p7 --ready-timeout 1200
 ```
 
 Each run starts from an empty prompt cache: the engine is sent `MEMFORGET` (so a

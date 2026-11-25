@@ -752,11 +752,12 @@ curl -s localhost:8080/v1/memt -H 'content-type: application/json' -d '{"action"
 
 # P6 / P7 once a GPU and the reference are available
 python terminal/tools/memt_parity.py --ref-url http://127.0.0.1:30000 --ref-state-dir /data/memt-state \
-    --engine ./strata-q36 --engine-arg --model --engine-arg nano.memt.gguf \
-    --engine-model-dir /models/MemT-1.0-Nano --commit evidence.ids --prompt q1.ids --outdir runs/p6
+    --engine ./strata-q36 --engine-arg=--model --engine-arg=nano.memt.gguf --engine-arg=--serve \
+    --engine-model-dir /models/MemT-1.0-Nano --commit evidence.ids --prompt q1.ids --outdir runs/p6 \
+    --ready-timeout 1200
 python terminal/tools/memt_bench.py --side both --ref-url http://127.0.0.1:30000 \
-    --engine ./strata-q36 --engine-arg --model --engine-arg nano.memt.gguf \
-    --prompt q1.ids --max-new 128 --runs 3 --outdir runs/p7
+    --engine ./strata-q36 --engine-arg=--model --engine-arg=nano.memt.gguf --engine-arg=--serve \
+    --prompt q1.ids --max-new 128 --runs 3 --outdir runs/p7 --ready-timeout 1200
 ```
 
 ---
